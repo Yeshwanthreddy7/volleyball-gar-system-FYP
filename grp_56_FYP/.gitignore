@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual Environment
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# Dataset
+dataset/
+training_csv/
+auto_training_data/
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Model Weights
+*.pt
+*.pth
+
+# Generated Reports
+annotated_csv_report.csv
+training_history.csv
+
+# Generated Images
+*.png
+*.jpg
