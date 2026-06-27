@@ -1,0 +1,7 @@
+video_file,anchor_time,tactic_class
+match1.mp4,00:02:14.5,coordinated_attack
+match1.mp4,00:05:33.0,spacing_breakdown
+match1.mp4,00:08:47.2,coordinated_defense
+match1.mp4,00:11:15.0,delayed_support
+match2.mp4,00:01:22.0,coordinated_attack
+match2.mp4,00:03:45.5,coordinated_defense
