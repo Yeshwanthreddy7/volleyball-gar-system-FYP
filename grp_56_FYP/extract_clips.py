@@ -196,7 +196,7 @@ def build_dataset(labels_path: str) -> None:
             clip_path,
         ]
 
-        print(f"[{idx+1:03d}/{len(df):03d}] {tactic:<22s} @ {start_str} → {clip_name}")
+        print(f"[{idx+1:03d}/{len(df):03d}] {tactic:<22s} @ {start_str} -> {clip_name}")
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if result.returncode == 0:
             success += 1

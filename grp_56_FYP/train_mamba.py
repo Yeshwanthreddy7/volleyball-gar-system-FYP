@@ -328,7 +328,7 @@ def save_confusion_heatmap(cm: torch.Tensor, path: str) -> None:
     plt.tight_layout()
     plt.savefig(path, dpi=120)
     plt.close()
-    print(f"  Confusion matrix heatmap saved → {path}")
+    print(f"  Confusion matrix heatmap saved -> {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -432,7 +432,7 @@ def train(args: argparse.Namespace) -> None:
     val_loader   = DataLoader(val_ds,   shuffle=False, **kw) if val_ds   else None
     test_loader  = DataLoader(test_ds,  shuffle=False, **kw) if test_ds  else None
 
-    print(f"\nSplit  →  Train: {len(train_idx)}  Val: {len(val_idx)}  Test: {len(test_idx)}")
+    print(f"\nSplit  ->  Train: {len(train_idx)}  Val: {len(val_idx)}  Test: {len(test_idx)}")
     print("Class distribution:")
     for split_name, indices in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
         dist = split_distribution(dataset, indices)
@@ -500,12 +500,12 @@ def train(args: argparse.Namespace) -> None:
                 break
 
     print(f"\nBest val macro-F1 = {best_f1:.4f}  at epoch {best_epoch}")
-    print(f"Checkpoint saved  → {args.checkpoint}")
+    print(f"Checkpoint saved  -> {args.checkpoint}")
 
     # ── Save training history ─────────────────────────────────────────────────
     if args.history_csv:
         pd.DataFrame(history).to_csv(args.history_csv, index=False)
-        print(f"Training history  → {args.history_csv}")
+        print(f"Training history  -> {args.history_csv}")
 
     # ── Final test evaluation ─────────────────────────────────────────────────
     if test_loader:

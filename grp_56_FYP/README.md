@@ -1,248 +1,325 @@
-# Volleyball Tactical Video Analysis System
-### Back-Center End-Line Camera | YOLOv11 + ByteTrack + Homography + Mamba SSM
+# Volleyball Tactical Analysis System
+### Final Year Project — Group 56
+**YOLOv11 · ByteTrack · Homography · Mamba SSM**
+
+An end-to-end computer vision pipeline that automatically detects, tracks, and classifies volleyball tactics from match footage filmed from a back-center end-line camera.
+
+---
+
+## What It Does
+
+Takes a raw volleyball match video + a tactic timeline CSV and produces a fully annotated output video showing:
+
+| Annotation | Detail |
+|---|---|
+| Player bounding boxes | Near-team only (P1–P6), stable IDs that never switch |
+| Ball bounding box | Pink box, kinematic prediction between missed frames |
+| Ball motion trail | Last 40 positions, fading from bright to dim |
+| Tactic banner (top-right) | Colour-coded label from CSV, visible for 8 s after anchor |
+| CSV event log (bottom) | Running history of all triggered tactic events |
+| Frame counter (top-left) | Frame number + MM:SS.ss timestamp |
+
+**4 Tactic Classes:**
+
+| Class | Box Colour | Description |
+|---|---|---|
+| Coordinated Attack | RED | Organised offensive pattern |
+| Coordinated Defense | BLUE | Structured defensive formation |
+| Delayed Support | YELLOW | Delayed back-court support movement |
+| Spacing Breakdown | GREEN | Breakdown of positional spacing |
+
+---
+
+## Project Structure
+
+```
+grp_56_FYP/
+├── annotate_from_csv.py       ← MAIN SCRIPT — annotate video from a pre-labeled CSV
+├── pipeline.py                ← Core library (YOLO, ByteTrack, BallTracker, drawing)
+├── mamba_model.py             ← Mamba SSM classifier + shared constants
+├── train_mamba.py             ← Train the Mamba model on feature CSVs
+├── infer_mamba.py             ← Run a trained Mamba checkpoint on a video or CSV
+├── prepare_training_data.py   ← Extract 14-feature CSVs from labeled clips
+├── extract_clips.py           ← Cut rally clips from full match videos
+├── pick_corners.py            ← Interactive tool to click court corners
+├── auto_corners.py            ← Automatic court corner detection (HSV)
+├── label_clips.py             ← Rule-based auto-labeler for extracted clips
+├── labels_template.csv        ← Template for manual labeling
+├── requirements.txt           ← Python dependencies
+└── dataset/
+    ├── videoplayback (1).mp4  ← Input match video (1280×720, 30 fps, 39 min)
+    └── csv_video(1).txt       ← Pre-labeled tactic timeline (126 events)
+```
+
+---
+
+## Quick Start — Generate Annotated Video
+
+> The virtual environment (`venv/`) is already set up. Just run these two commands.
+
+### Step 1 — Navigate into the project folder
+
+```powershell
+cd "C:\Users\yashwanth\Downloads\Yeshwanth_FYP\grp_56_FYP"
+```
+
+### Step 2 — Run the annotation pipeline
+
+```powershell
+.\venv\Scripts\python.exe -u annotate_from_csv.py --video "dataset/videoplayback (1).mp4" --csv "dataset/csv_video(1).txt" --output annotated_csv.mp4 --conf 0.20 --ball-conf 0.08 --stride 1 --max-players 6
+```
+
+**Processing time:** ~1.5 hours for a 39-minute video on CPU.  
+Progress is printed every 500 frames so you can see it running.
+
+### Step 3 — Open the output
+
+```powershell
+Start-Process "C:\Users\yashwanth\Downloads\Yeshwanth_FYP\grp_56_FYP\annotated_csv.mp4"
+```
+
+**Output files created:**
+```
+annotated_csv.mp4          ← fully annotated video
+annotated_csv_report.csv   ← per-frame tactic label table
+```
+
+---
+
+## Installation (First Time Only)
+
+```powershell
+cd "C:\Users\yashwanth\Downloads\Yeshwanth_FYP\grp_56_FYP"
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+YOLOv11 weights (`yolo11n.pt`) are downloaded automatically on the first run.
+
+---
+
+## All Flags — `annotate_from_csv.py`
+
+| Flag | Default | Description |
+|---|---|---|
+| `--video` | *(required)* | Path to input match video |
+| `--csv` | *(required)* | Path to tactic timeline CSV |
+| `--output` | `annotated_csv.mp4` | Output video filename |
+| `--conf` | `0.20` | YOLO confidence threshold for person detection |
+| `--ball-conf` | `0.08` | YOLO confidence for ball detection (lower = more sensitive) |
+| `--stride` | `1` | Run YOLO every N frames (1 = every frame, 2 = 2× faster) |
+| `--max-players` | `6` | Max player slots (6 = standard volleyball team) |
+| `--display-window` | `8.0` | Seconds to keep tactic banner on screen after anchor time |
+| `--near-team-y` | `0.0` | Pixel-Y fraction fallback when homography fails (0 = disabled) |
+| `--track-all` | off | If set, track both teams, referees, and bench staff |
+| `--court-corners` | auto | 4 pixel corners TL TR BR BL for precise team filtering |
+| `--yolo-model` | `yolo11n.pt` | Path to YOLO weights |
+
+---
+
+## System Architecture
+
+```
+Match Video (.mp4)
+      │
+      ▼
+YOLOv11n Detection
+  ├── Persons  (class 0)  — conf ≥ 0.20
+  └── Ball     (class 32) — conf ≥ 0.08
+      │
+      ▼
+Near-Team Filter (homography)
+  └── Keeps players with court Y ≥ 900 cm (net line) or body centre ≥ 700 cm
+      (jumping players included via centre-of-body check)
+      │
+      ▼
+ByteTrack  (lost_track_buffer = 150 frames)
+  └── Persistent tracker IDs across occlusions
+      │
+      ▼
+PlayerIDMapper
+  └── Maps ByteTrack IDs → stable display slots P1–P6 (never reassigned)
+      │
+      ▼
+BallTracker  (kinematic bridge)
+  └── Constant-velocity prediction for up to 30 missed frames (~1 second)
+      Auto-resets if predicted position diverges off-screen
+      │
+      ▼
+Homography  (cv2.findHomography)
+  └── Pixel coordinates → real-world court centimetres
+      Auto-detected from frame 0 if no manual corners given
+      │
+      ▼
+14-Feature Vector per frame
+  └── [ball_x, ball_y, p1_x, p1_y, p2_x, p2_y, … p6_x, p6_y]  (court cm)
+      │
+      ▼
+Mamba SSM Classifier  (seq_len = 29, input_dim = 14)
+  └── 4-class tactic output: Attack / Defense / Delayed / Spacing
+      │
+      ▼
+Frame Annotation
+  └── Rounded player boxes + badge · Ball box + trail · Tactic panel · Event log
+      │
+      ▼
+annotated_csv.mp4  +  annotated_csv_report.csv
+```
 
 ---
 
 ## Court Coordinate System
 
 ```
-Camera (back-center, behind Team A end line, elevated 6–10 m)
-       │
-  Y=1800 ──── Team A end line (near, camera side) ────
-  Y=1200 ──── 3m attack line (Team A) ────────────────
-  Y= 900 ──── NET ─────────────────────────────────────
-  Y= 600 ──── 3m attack line (Team B) ────────────────
-  Y=   0 ──── Team B end line (far) ──────────────────
-               X=0         X=900
-            (left side)  (right side)
-```
+Camera (back-center, elevated 6–10 m behind Team A's end line)
 
-- **X-axis**: 0–900 cm (9 m court width, left → right from camera perspective)  
-- **Y-axis**: 0–1800 cm (18 m court length, far end → camera end)  
-- **Net**: Y = 900 cm  
-- **Team A (tracked)**: Y = 900–1800 cm (near team, camera is behind them)  
-- **Team B (not tracked)**: Y = 0–900 cm
+Y=1800 ─── Team A end line  (near — camera side)
+             │                │
+             │   Team A       │  ← tracked (P1–P6)
+             │   Y: 900–1800  │
+Y= 900 ──── NET ─────────────────
+             │   Team B       │  ← filtered out
+             │   Y: 0–900     │
+Y=   0 ─── Team B end line   (far)
 
----
-
-## 4 Tactic Classes
-
-| Index | Label | Description |
-|-------|-------|-------------|
-| 1 | Coordinated Attack | ≥2 attackers moving toward net together with high sync |
-| 2 | Coordinated Defense | Team shifting laterally as a unit, formation maintained |
-| 3 | Delayed Support | Player arrives late to support position after ball contact |
-| 4 | Spacing Breakdown | Formation gap (>600 cm) or collision (<50 cm) |
-
----
-
-## File Overview
-
-```
-fyp/
-├── mamba_model.py          ← Mamba SSM architecture + shared constants
-├── label_clips.py          ← Rule-based auto-labeling engine
-├── extract_clips.py        ← Cuts rally clips from full match videos
-├── prepare_training_data.py← Converts clips → training CSVs (sliding window)
-├── train_mamba.py          ← Training loop with augmentation, metrics
-├── pipeline.py             ← Full inference pipeline (video → annotated video)
-├── infer_mamba.py          ← Standalone inference (CSV or video)
-├── requirements.txt        ← Python dependencies
-└── labels_template.csv     ← Annotation template for your 12 match videos
+X=0 (left sideline) ────────────── X=900 cm (right sideline)
 ```
 
 ---
 
-## Installation
+## Training the Mamba Model (Optional)
 
-```bash
-pip install -r requirements.txt
+Follow these steps only if you want to train the model on new match data.
+
+### 1 — Create your labels file
+
+Use `labels_template.csv` as a starting point. Fill one row per rally:
+
 ```
-
-For YOLOv11, ultralytics will download weights automatically on first run.  
-Alternatively download manually:
-```bash
-# YOLOv11 nano (fastest, use for testing)
-wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt
-
-# YOLOv11 small (better accuracy)
-wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt
-```
-
----
-
-## Step-by-Step Workflow
-
-### Step 1 — Annotate Your 12 Match Videos
-
-Copy `labels_template.csv` → `labels.csv`.  
-Watch each video and fill in one row per rally you want labeled:
-
-```csv
 video_file,anchor_time,tactic_class
 match1.mp4,00:02:14.5,coordinated_attack
 match1.mp4,00:05:33.0,spacing_breakdown
-match1.mp4,00:08:47.2,coordinated_defense
-match2.mp4,00:01:22.0,delayed_support
 ```
 
-`anchor_time` = the moment the ball is contacted (serve/spike/dig).  
-Format: `HH:MM:SS.s` or `MM:SS.s`
+`anchor_time` = moment of ball contact (serve / spike / dig).
+
+### 2 — Extract rally clips
+
+```powershell
+.\venv\Scripts\python.exe extract_clips.py --labels labels.csv
+```
+
+Creates 2-second clips under `dataset/Coordinated_Attack/`, `dataset/Spacing_Breakdown/`, etc.
+
+### 3 — Prepare training feature CSVs
+
+```powershell
+.\venv\Scripts\python.exe prepare_training_data.py dataset --output-dir training_csv --court-corners 42,18 1238,18 1238,702 42,702
+```
+
+### 4 — Train
+
+```powershell
+.\venv\Scripts\python.exe train_mamba.py training_csv --epochs 60 --batch_size 32 --lr 1e-3 --checkpoint mamba_checkpoint.pt
+```
+
+Outputs: checkpoint `.pt`, confusion matrix `.png`, `training_history.csv`.
+
+### 5 — Infer with the trained model
+
+```powershell
+.\venv\Scripts\python.exe pipeline.py "dataset/videoplayback (1).mp4" mamba_checkpoint.pt --court-corners 42,18 1238,18 1238,702 42,702 --output-video annotated.mp4 --output-csv predictions.csv
+```
 
 ---
 
-### Step 2 — Extract Rally Clips
+## How to Set Precise Court Corners
 
-```bash
-python extract_clips.py --labels labels.csv
+Better court corners = better team filtering (fewer opponent players leaking through).
+
+```powershell
+.\venv\Scripts\python.exe pick_corners.py "dataset/videoplayback (1).mp4"
 ```
 
-Creates:
-```
-dataset/
-  Coordinated_Attack/   ← clip_0001.mp4, clip_0002.mp4, …
-  Coordinated_Defense/
-  Delayed_Support/
-  Spacing_Breakdown/
-```
+Click the 4 corners in this order on the video frame:
+1. **Far-Left** — far end of court, left sideline
+2. **Far-Right** — far end of court, right sideline
+3. **Near-Right** — near end (camera side), right sideline
+4. **Near-Left** — near end (camera side), left sideline
 
-Each clip is **2 seconds** (60 frames), starting 0.3 s before the anchor time.
+Copy the printed pixel coordinates into `--court-corners` when running annotation.
 
 ---
 
-### Step 3 — Prepare Training CSVs
+## Mamba Model Architecture
 
-**Important**: Measure your court corners first (see below), then run:
-
-```bash
-python prepare_training_data.py dataset \
-    --output-dir training_csv \
-    --yolo-model yolo11n.pt \
-    --court-corners 42,18 1238,18 1238,702 42,702 \
-    --stride 5
+```
+Input:  (batch, seq_len=29, input_dim=14)
+             ↓
+    Linear(14 → d_model=64)
+             ↓
+    MambaBlock × 4   [SelectiveSSM + pre-norm residual]
+             ↓
+    LayerNorm
+             ↓
+    Global Average Pool  →  (batch, 64)
+             ↓
+    Dropout → Linear(64→32) → GELU → Dropout → Linear(32→4)
+             ↓
+Output: logits (batch, 4)   ~45,000 trainable parameters
 ```
 
-- `--court-corners TL TR BR BL`: pixel coordinates of the 4 court boundary corners  
-  as seen by your back-center camera (TL=far-left, TR=far-right, BR=near-right, BL=near-left).  
-- `--stride 5`: sliding window step → generates multiple CSVs per clip  
-- Without `--court-corners`, linear pixel scaling is used (less accurate)
-
-Output: `training_csv/*.csv` — one CSV per 29-frame window, labeled.
+Reference: Gu & Dao (2023). *Mamba: Linear-Time Sequence Modeling with Selective State Spaces.* arXiv:2312.00752
 
 ---
 
-### Step 4 — Train the Mamba Model
+## Results
 
-```bash
-python train_mamba.py training_csv \
-    --epochs 60 \
-    --batch_size 32 \
-    --lr 1e-3 \
-    --checkpoint mamba_checkpoint.pt
-```
+Full annotation run on `videoplayback (1).mp4` (39 min, 70,591 frames):
 
-Training output includes:
-- Per-epoch: train loss, train acc, val loss, val acc, val macro-F1
-- Final test set: accuracy, macro-F1, balanced accuracy
-- **Per-class F1** for all 4 tactic classes
-- **Formatted confusion matrix** (printed + saved as `mamba_checkpoint_cm.png`)
-- `training_history.csv` with all per-epoch metrics
-
----
-
-### Step 5 — Run Inference on a New Match Video
-
-```bash
-python pipeline.py new_match.mp4 mamba_checkpoint.pt \
-    --yolo-model yolo11n.pt \
-    --court-corners 42,18 1238,18 1238,702 42,702 \
-    --stride 15 \
-    --output-video annotated_match.mp4 \
-    --output-csv predictions.csv
-```
-
-The annotated video shows:
-- **Rounded bounding boxes** around each tracked Team A player (color = tactic)
-- **Player ID** badge above each box (P1, P2, …)
-- **Ball marker**: white ring + orange fill (detected) or grey ring (predicted)
-- **Ball trail**: fading orange dots showing recent ball path
-- **Net reference line** at the approximate net position
-- **Tactic banner** at the bottom:
-  - Large text: ATTACKING / DEFENDING / DELAYED SUPPORT / SPACING BREAKDOWN
-  - Small text: full label name + confidence score
-- **Frame counter** and timestamp (top left)
-
----
-
-### Step 6 — Test on a Single CSV (quick model check)
-
-```bash
-python infer_mamba.py --csv training_csv/some_clip.csv \
-    --checkpoint mamba_checkpoint.pt
-```
-
-Prints the predicted tactic and per-class probability bar chart.
-
----
-
-## How to Find Court Corners (Homography Setup)
-
-1. Open your match video in any video player.
-2. Pause at a clear frame where all 4 court boundary corners are visible.
-3. Note the **pixel (x, y)** coordinates of:
-
-```
-TL = Top-Left corner     = Team B's far-left corner (far end of court)
-TR = Top-Right corner    = Team B's far-right corner
-BR = Bottom-Right corner = Team A's near-right corner (camera side)
-BL = Bottom-Left corner  = Team A's near-left corner
-```
-
-Use a tool like GIMP, Paint, or VLC (Tools → Media Info shows pixel position) to read pixel coords.
-
-Example: `--court-corners 42,18 1238,18 1238,702 42,702`
-
----
-
-## Data Augmentation (applied during training)
-
-| Augmentation | Description |
+| Metric | Value |
 |---|---|
-| Horizontal flip (50%) | Mirror X coordinates of all players/ball; simulates attack from opposite wing |
-| Time jitter (±3 frames) | Shift window start randomly; varied temporal viewpoints |
-| Gaussian noise (σ=0.01) | Small random perturbation on normalised features |
+| Total frames annotated | 70,591 / 70,591 (100%) |
+| CSV events detected | 126 / 126 |
+| Coordinated Attack | 40 events (31.7%) |
+| Coordinated Defense | 40 events (31.7%) |
+| Spacing Breakdown | 39 events (31.0%) |
+| Delayed Support | 7 events (5.6%) |
+| Processing time (CPU, stride=1) | ~1.5 hours |
 
 ---
 
-## Model Architecture
+## Requirements
 
-```
-Input: (batch, 29, 14)
-           ↓
-  Linear(14 → d_model=64)
-           ↓
-  MambaBlock × 4  [SelectiveSSM + pre-norm residual]
-           ↓
-  LayerNorm
-           ↓
-  GlobalAveragePool (over 29 frames) → (batch, 64)
-           ↓
-  Dropout → Linear(64→32) → GELU → Dropout → Linear(32→4)
-           ↓
-Output: logits (batch, 4)
-```
-
-Trainable parameters: ~45,000
+| Package | Minimum Version |
+|---|---|
+| Python | 3.10+ |
+| ultralytics | 8.3.0 |
+| supervision | 0.21.0 |
+| torch | 2.0.0 |
+| torchvision | 0.15.0 |
+| opencv-python | 4.7.0 |
+| numpy | 1.24.0 |
+| pandas | 2.0.0 |
+| scikit-learn | 1.3.0 |
+| matplotlib | 3.7.0 |
 
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Problem | Solution |
 |---|---|
-| No players detected | Lower `--conf-threshold` to 0.25 |
-| Wrong team tracked | Check `--court-corners` pixel values (TL/TR/BR/BL order) |
-| All classified as one tactic | Check class distribution in training_csv; collect more samples for minority classes |
-| YOLOv11 not found | Run: `pip install ultralytics --upgrade` |
-| ByteTrack IDs jumping | Normal for occlusion; ByteTrack handles reappearance automatically |
-| Ball never detected | YOLOv11n uses COCO class 32 (sports ball); consider fine-tuning on volleyball images |
+| `.\venv\Scripts\python.exe not recognized` | Run `cd grp_56_FYP` first — you must be inside this folder |
+| Ball not appearing in output video | Lower `--ball-conf` to `0.05` |
+| Players missing boxes (jumping, blurred) | Lower `--conf` to `0.15` |
+| Opponent team boxes showing | Run `pick_corners.py` and pass precise corners via `--court-corners` |
+| Video takes too long to process | Use `--stride 2` to halve processing time |
+| Ghost boxes in empty areas | Already fixed — boxes disappear after 5 frames of no detection |
+| Out of memory | Use `yolo11n.pt` (nano) instead of larger variants |
+
+---
+
+## Authors
+
+Group 56 — Final Year Project
