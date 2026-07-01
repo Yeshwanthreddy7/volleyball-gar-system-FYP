@@ -306,7 +306,7 @@ def print_confusion_matrix(cm: torch.Tensor, title: str = "Confusion Matrix") ->
         row = cm[i].tolist()
         vals = "  ".join(f"{int(v):5d}" for v in row)
         label_full = LABEL_NAMES[i]
-        print(f"  {row_name}  | {vals}   ← {label_full}")
+        print(f"  {row_name}  | {vals}   <- {label_full}")
     print()
 
 

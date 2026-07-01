@@ -4,20 +4,20 @@ pipeline.py – End-to-End Volleyball Tactical Analysis Pipeline
 
 Complete processing chain:
   Match Video (.mp4)
-      ↓  Frame Extraction
-      ↓  YOLOv11 Detection  (players + ball)
-      ↓  Near-Team Filter   (Team A only: court_y ≥ NET_Y_CM)
-      ↓  ByteTrack          (persistent player IDs)
-      ↓  Homography         (pixel → court cm coordinates)
-      ↓  14-Feature Vector  [ball_x, ball_y, p1_x, p1_y, …, p6_x, p6_y]
-      ↓  Sliding Window     (29 frames, stride configurable)
-      ↓  Mamba Classifier   (4-class: Attack / Defense / Delayed / Spacing)
-      ↓  Frame Annotation   (bounding boxes, ball, tactic banner)
-      ↓  Annotated Video + Predictions CSV
+      ->  Frame Extraction
+      ->  YOLOv11 Detection  (players + ball)
+      ->  Near-Team Filter   (Team A only: court_y ≥ NET_Y_CM)
+      ->  ByteTrack          (persistent player IDs)
+      ->  Homography         (pixel -> court cm coordinates)
+      ->  14-Feature Vector  [ball_x, ball_y, p1_x, p1_y, …, p6_x, p6_y]
+      ->  Sliding Window     (29 frames, stride configurable)
+      ->  Mamba Classifier   (4-class: Attack / Defense / Delayed / Spacing)
+      ->  Frame Annotation   (bounding boxes, ball, tactic banner)
+      ->  Annotated Video + Predictions CSV
 
 Court coordinate system (after homography):
-  X : 0–900 cm   (9m width: left sideline → right sideline)
-  Y : 0–1800 cm  (18m length: far end Y=0 → camera end Y=1800)
+  X : 0–900 cm   (9m width: left sideline -> right sideline)
+  Y : 0–1800 cm  (18m length: far end Y=0 -> camera end Y=1800)
   Net at Y = 900 cm
   Team A (near, tracked): Y = 900–1800 cm
   Team B (far):           Y = 0–900 cm
@@ -41,6 +41,7 @@ from collections import deque
 import cv2
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 import torch
 import torch.nn.functional as F
 
@@ -104,9 +105,10 @@ DISPLAY_NAMES: dict[str, str] = {
     "Spacing Breakdown":   "SPACING BREAKDOWN",
 }
 
-BALL_TRAIL_LEN   = 40
-BALL_MAX_MISS    = 30
-CONF_THRESHOLD   = 0.35
+BALL_TRAIL_LEN      = 40
+BALL_MAX_MISS       = 60          # 2 s at 30 fps before ball is considered lost
+CONF_THRESHOLD      = 0.35
+BALL_CONF_THRESHOLD = 0.15        # lower threshold — volleyball is small and fast
 
 PERSON_CLS = 0
 BALL_CLS   = 32
@@ -156,33 +158,37 @@ class BallTracker:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Player ID Mapper  (ByteTrack IDs → sequential display IDs 1-6)
+# Player ID Mapper  (ByteTrack IDs -> sequential display IDs 1-6)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class PlayerIDMapper:
     """
-    Maps raw ByteTrack IDs (can be any large integer) to sequential
-    display slots 1–N_PLAYERS.  Once a slot is assigned it stays assigned
-    to the same physical player for the entire video.
+    Assigns stable P1-P6 labels via Hungarian (linear-sum) assignment.
 
-    When a brand-new ByteTrack ID appears (player re-enters frame after
-    occlusion):
-      • If a free slot exists  → assign the lowest free slot.
-      • If all slots are taken → assign the slot whose last known position
-        is closest to the new detection (re-identification by proximity).
+    Every frame, ALL current detections are matched against ALL known slot
+    positions in one global optimisation step that minimises total centroid
+    distance.  ByteTrack's internal IDs are IGNORED for slot assignment —
+    this eliminates label swaps caused by ByteTrack re-numbering players
+    when they cross paths or dive.
     """
 
-    def __init__(self, n: int = N_PLAYERS) -> None:
-        self.n = n
-        self._bt_to_slot: dict[int, int]          = {}
-        self._slot_pos:   dict[int, tuple[float, float]] = {}
+    def __init__(self, n: int = N_PLAYERS, max_dist: float = 250.0) -> None:
+        self.n        = n
+        self.max_dist = max_dist          # pixels; detections farther than this
+                                          # from every slot start a new slot
+        self._slot_box: dict[int, tuple] = {}   # slot -> last (x1,y1,x2,y2)
+
+    @staticmethod
+    def _cx(b: tuple) -> float: return (b[0] + b[2]) / 2.0
+    @staticmethod
+    def _cy(b: tuple) -> float: return (b[1] + b[3]) / 2.0
 
     def update(
         self, tracks: "sv.Detections"
     ) -> tuple[dict[int, tuple], set[int]]:
         """
         Returns:
-          slot_boxes  : dict  slot(1-N) → (x1, y1, x2, y2)
+          slot_boxes  : dict  slot(1-N) -> (x1, y1, x2, y2)
           active_slots: set   which slots are detected this frame
         """
         slot_boxes:   dict[int, tuple] = {}
@@ -191,49 +197,53 @@ class PlayerIDMapper:
         if tracks.tracker_id is None or len(tracks.tracker_id) == 0:
             return slot_boxes, active_slots
 
-        # Only ByteTrack IDs present in THIS frame are considered to occupy a slot.
-        # Historical IDs that ByteTrack has stopped tracking are freed so that a
-        # re-entering player (new ByteTrack ID) can reclaim their original slot via
-        # proximity matching instead of being pushed out.
-        current_tids = {int(t) for t in tracks.tracker_id}
+        boxes = [tuple(float(v) for v in b) for b in tracks.xyxy]
+        n_det = len(boxes)
 
-        for tid, (x1, y1, x2, y2) in zip(tracks.tracker_id, tracks.xyxy):
-            tid = int(tid)
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        # ── First frame: assign slots in detection order left→right ───────────
+        if not self._slot_box:
+            sorted_boxes = sorted(boxes[:self.n], key=lambda b: self._cx(b))
+            for i, box in enumerate(sorted_boxes):
+                self._slot_box[i + 1] = box
+                slot_boxes[i + 1]     = box
+                active_slots.add(i + 1)
+            return slot_boxes, active_slots
 
-            if tid not in self._bt_to_slot:
-                # Slots are "occupied" only if their ByteTrack ID is still active
-                occupied = {slot for bt_id, slot in self._bt_to_slot.items()
-                            if bt_id in current_tids}
-                free = [s for s in range(1, self.n + 1) if s not in occupied]
-                if free:
-                    # Prefer the slot whose last known position is closest to
-                    # this detection — re-identifies a returning player.
-                    if self._slot_pos:
-                        free.sort(
-                            key=lambda s: (
-                                (self._slot_pos[s][0] - cx) ** 2
-                                + (self._slot_pos[s][1] - cy) ** 2
-                            ) if s in self._slot_pos else float("inf")
-                        )
-                    slot = free[0]
-                elif self._slot_pos:
-                    # All N slots currently active — steal the nearest one
-                    slot = min(
-                        range(1, self.n + 1),
-                        key=lambda s: (
-                            (self._slot_pos.get(s, (cx, cy))[0] - cx) ** 2
-                            + (self._slot_pos.get(s, (cx, cy))[1] - cy) ** 2
-                        ),
-                    )
-                else:
-                    slot = 1
-                self._bt_to_slot[tid] = slot
+        # ── Build centroid-distance cost matrix (slots × detections) ──────────
+        slots   = sorted(self._slot_box)
+        n_slots = len(slots)
+        cost    = np.empty((n_slots, n_det), dtype=float)
+        for i, s in enumerate(slots):
+            sx = self._cx(self._slot_box[s])
+            sy = self._cy(self._slot_box[s])
+            for j, b in enumerate(boxes):
+                dx = self._cx(b) - sx
+                dy = self._cy(b) - sy
+                cost[i, j] = (dx * dx + dy * dy) ** 0.5
 
-            slot = self._bt_to_slot[tid]
-            self._slot_pos[slot] = (cx, cy)
-            slot_boxes[slot]     = (x1, y1, x2, y2)
-            active_slots.add(slot)
+        # ── Hungarian assignment — globally optimal matching ───────────────────
+        row_idx, col_idx = linear_sum_assignment(cost)
+        assigned_dets: set[int] = set()
+        for ri, ci in zip(row_idx, col_idx):
+            if cost[ri, ci] <= self.max_dist:
+                slot = slots[ri]
+                self._slot_box[slot] = boxes[ci]
+                slot_boxes[slot]     = boxes[ci]
+                active_slots.add(slot)
+                assigned_dets.add(ci)
+
+        # ── Unmatched detections → fill any remaining free slots ──────────────
+        occupied = set(self._slot_box)
+        for j, box in enumerate(boxes):
+            if j in assigned_dets:
+                continue
+            for s in range(1, self.n + 1):
+                if s not in occupied:
+                    self._slot_box[s] = box
+                    slot_boxes[s]     = box
+                    active_slots.add(s)
+                    occupied.add(s)
+                    break   # one new slot per unmatched detection
 
         return slot_boxes, active_slots
 
@@ -244,13 +254,13 @@ class PlayerIDMapper:
 
 def build_homography(corners: list[tuple[float, float]]) -> np.ndarray:
     """
-    Perspective homography from 4 pixel corners → court cm.
+    Perspective homography from 4 pixel corners -> court cm.
 
     corners (TL, TR, BR, BL pixel coords) map to:
-      TL → (0,               0              )   far-left (Team B end)
-      TR → (COURT_WIDTH_CM,  0              )   far-right
-      BR → (COURT_WIDTH_CM,  COURT_LENGTH_CM)   near-right (Team A end)
-      BL → (0,               COURT_LENGTH_CM)   near-left
+      TL -> (0,               0              )   far-left (Team B end)
+      TR -> (COURT_WIDTH_CM,  0              )   far-right
+      BR -> (COURT_WIDTH_CM,  COURT_LENGTH_CM)   near-right (Team A end)
+      BL -> (0,               COURT_LENGTH_CM)   near-left
     """
     src = np.array(corners, dtype=np.float32)
     dst = np.array([
@@ -376,7 +386,7 @@ def extract_positions(
     track_age: dict[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Convert ByteTrack detections → court positions.
+    Convert ByteTrack detections -> court positions.
 
     Returns:
       player_pos : (N_PLAYERS, 2) court cm  [centroid-filled if fewer than 6 detected]
@@ -609,7 +619,7 @@ def annotate_frame(
             continue
         x1, y1, x2, y2 = [int(round(float(v))) for v in display_boxes[slot]]
         is_active = slot in active_slots
-        # Active detection → full activity colour; ghost (predicted) → dimmed
+        # Active detection -> full activity colour; ghost (predicted) -> dimmed
         if is_active:
             color = box_color
             thick = 2
@@ -716,6 +726,56 @@ def annotate_frame(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Ground-truth CSV loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Maps the CSV spelling (British + underscores) to internal label names
+_CSV_TO_LABEL: dict[str, str] = {
+    "Spacing_Breakdown":   "Spacing Breakdown",
+    "Coordinated_Attack":  "Coordinated Attack",
+    "Coordinated_Defence": "Coordinated Defense",
+    "Coordinated_Defense": "Coordinated Defense",
+    "Delayed_Support":     "Delayed Support",
+}
+
+def load_ground_truth(csv_path: str) -> list[tuple[float, str]]:
+    """
+    Parse the project annotation CSV (video_file  anchor_time  tactic_class).
+    Returns a list of (seconds, label) sorted by time.
+    """
+    df = pd.read_csv(csv_path, sep=r"\s+", engine="python")
+    ann: list[tuple[float, str]] = []
+    for _, row in df.iterrows():
+        t_str = str(row["anchor_time"]).strip()
+        try:
+            m, s = t_str.split(":")
+            secs = float(m) * 60 + float(s)
+        except Exception:
+            continue
+        label = _CSV_TO_LABEL.get(str(row["tactic_class"]).strip(), "")
+        if label:
+            ann.append((secs, label))
+    ann.sort(key=lambda x: x[0])
+    return ann
+
+
+def gt_label_at(ann: list[tuple[float, str]], t: float, hold: float = 30.0) -> str:
+    """
+    Return the most recent annotation at or before time t, held for up to
+    `hold` seconds.  Returns "" outside all annotation windows so dead-ball
+    periods (celebrations, between-rally breaks) show no label.
+    """
+    label = ""
+    for at, lbl in ann:
+        if at <= t:
+            if t - at <= hold:
+                label = lbl
+        else:
+            break
+    return label
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -751,6 +811,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
         print("No Mamba checkpoint – using rule-based fallback classification.")
         from label_clips import label_clip, LABEL_TO_INDEX as RULE_IDX
 
+    # ── Ground-truth CSV (overrides Mamba predictions when supplied) ─────────
+    gt_ann: list[tuple[float, str]] = []
+    if getattr(args, "ground_truth_csv", None):
+        gt_ann = load_ground_truth(args.ground_truth_csv)
+        print(f"Ground-truth CSV loaded: {len(gt_ann)} annotations "
+              f"from '{args.ground_truth_csv}'")
+
     # ── Homography ────────────────────────────────────────────────────────────
     H: np.ndarray | None = None
     if args.court_corners:
@@ -766,7 +833,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 H = build_homography(auto_c)
                 print("Homography: auto-detected court corners ✓  (see corners_debug.jpg)")
             else:
-                print(f"[WARN] Auto-detection failed → "
+                print(f"[WARN] Auto-detection failed -> "
                       f"linear scaling to {COURT_WIDTH_CM}×{COURT_LENGTH_CM} cm.")
         except ImportError:
             print(f"Homography: linear scaling to {COURT_WIDTH_CM}×{COURT_LENGTH_CM} cm.")
@@ -817,7 +884,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     ball_tracker  = BallTracker()
     ball_trail: deque = deque(maxlen=BALL_TRAIL_LEN)
     id_mapper        = PlayerIDMapper(N_PLAYERS)
-    persistent_boxes: dict[int, tuple] = {}   # slot → last known (x1,y1,x2,y2)
+    persistent_boxes: dict[int, tuple] = {}   # slot -> last known (x1,y1,x2,y2)
     active_slots:     set[int]         = set()
 
     current_label        = ""
@@ -839,10 +906,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
         frames_since_last_classify += 1
 
         # ── YOLOv11 detection ─────────────────────────────────────────────────
-        p_xyxy, p_conf, ball_px = detect_frame(frame, yolo, args.conf_threshold)
+        ball_conf_thr = getattr(args, "ball_conf_threshold", BALL_CONF_THRESHOLD)
+        p_xyxy, p_conf, ball_px = detect_frame(
+            frame, yolo, args.conf_threshold, ball_conf=ball_conf_thr)
 
         # ── Near-team filter (Team A only, back-center camera) ────────────────
         p_xyxy, p_conf = filter_near_team(p_xyxy, p_conf, frame_w, frame_h, H)
+
+        # ── Cap to exactly N_PLAYERS by highest YOLO confidence ───────────────
+        # Prevents coaches/referees near the back line from stealing a slot.
+        if len(p_xyxy) > N_PLAYERS:
+            top_idx = np.argsort(p_conf)[::-1][:N_PLAYERS]
+            p_xyxy  = p_xyxy[top_idx]
+            p_conf  = p_conf[top_idx]
 
         # ── ByteTrack update ──────────────────────────────────────────────────
         dets = sv.Detections(
@@ -852,7 +928,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ) if len(p_xyxy) > 0 else sv.Detections.empty()
         tracks = tracker.update_with_detections(dets)
 
-        # ── Map ByteTrack IDs → sequential display slots P1–P6 ───────────────
+        # ── Map ByteTrack IDs -> sequential display slots P1–P6 ───────────────
         slot_boxes, active_slots = id_mapper.update(tracks)
         persistent_boxes.update(slot_boxes)   # keep last known bbox per slot
 
@@ -869,12 +945,23 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if len(ring_buf) > SEQ_LEN:
             ring_buf.pop(0)
 
+        # ── Ground-truth label override (uses CSV annotations when supplied) ────
+        if gt_ann:
+            t_now = frame_idx / fps
+            gt_lbl = gt_label_at(gt_ann, t_now, hold=30.0)
+            if gt_lbl != current_label:
+                activity_start_time = frame_idx / fps
+            current_label = gt_lbl
+            current_conf  = 1.0
+
         # Classify only when ball is on near team's half (court_y >= 900 cm).
         # No activity label is shown when ball is on opponent side / undetected.
         ball_in_near_half = (ball_pos[1] >= NET_Y_CM) if ball_pos[1] > 0 else False
 
         # Classify every `stride` frames once buffer is full AND ball is on near side
-        if (len(ring_buf) == SEQ_LEN
+        # (skipped when ground-truth CSV is supplied — GT takes priority)
+        if (not gt_ann
+                and len(ring_buf) == SEQ_LEN
                 and frames_since_last_classify >= args.stride
                 and ball_in_near_half):
 
@@ -930,7 +1017,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             })
 
             print(f"  Seq {seq_idx:4d}  frames {frame_idx-SEQ_LEN+1:5d}–{frame_idx:5d}"
-                  f"  →  [{numeric}] {DISPLAY_NAMES.get(label,label):<20s}  conf={conf:.3f}")
+                  f"  ->  [{numeric}] {DISPLAY_NAMES.get(label,label):<20s}  conf={conf:.3f}")
 
         # ── Ball trail update ─────────────────────────────────────────────────
         if ball_tracked is not None:
@@ -957,18 +1044,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
     cap.release()
     if writer:
         writer.release()
-        print(f"\nAnnotated video (.mp4) → '{args.output_video}'")
+        print(f"\nAnnotated video (.mp4) -> '{args.output_video}'")
     if writer2:
         writer2.release()
-        print(f"Annotated video (.avi) → '{args.output_avi}'")
+        print(f"Annotated video (.avi) -> '{args.output_avi}'")
 
     if predictions and args.output_csv:
         pd.DataFrame(predictions).to_csv(args.output_csv, index=False)
-        print(f"Predictions CSV → '{args.output_csv}'")
+        print(f"Predictions CSV -> '{args.output_csv}'")
 
     print(f"\nTotal frames : {frame_idx}  |  Sequences classified : {seq_idx}")
     if train_dir:
-        print(f"Training CSVs saved  : {train_saved}  →  {train_dir}/")
+        print(f"Training CSVs saved  : {train_saved}  ->  {train_dir}/")
 
     # Summary counts
     if predictions:
@@ -1006,7 +1093,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Trained Mamba checkpoint (.pt). Uses rule-based if omitted.")
     p.add_argument("--yolo-model",   default="yolo11n.pt",
                    help="YOLOv11 weights. Downloads automatically if not present.")
-    p.add_argument("--conf-threshold", type=float, default=CONF_THRESHOLD)
+    p.add_argument("--conf-threshold",      type=float, default=CONF_THRESHOLD)
+    p.add_argument("--ball-conf-threshold", type=float, default=BALL_CONF_THRESHOLD,
+                   help="Separate (lower) YOLO confidence for ball detection.")
     p.add_argument("--court-corners",  nargs=4, metavar=("TL","TR","BR","BL"),
                    action=_CornersAction, default=None,
                    help="4 pixel corners of court boundary (TL TR BR BL).")
@@ -1018,6 +1107,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--output-avi",   default="annotated.avi",
                    help="Second output in AVI/XVID format. Pass empty string to disable.")
     p.add_argument("--output-csv",   default="predictions.csv")
+    p.add_argument("--ground-truth-csv", default=None, metavar="CSV",
+                   help="Annotation CSV (video_file anchor_time tactic_class). "
+                        "When supplied, overrides Mamba predictions with ground-truth labels.")
     return p.parse_args()
 
 
